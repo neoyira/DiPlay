@@ -5,7 +5,11 @@ plugins {
 
 // Optional local-only input. CI and ordinary source builds contain no accessory identity.
 val localAuthenticationAssets = providers.environmentVariable("DIPLAY_AUTH_ASSETS_DIR")
-    .orNull?.let { file(it).canonicalFile }
+    .orNull?.let { file(it).canonicalFile } ?: layout.buildDirectory.dir("generated/mfiAssets").get().asFile.apply {
+        val mfiDir = resolve("offline-mfi").apply { mkdirs() }
+        mfiDir.resolve("identity.pk8").writeBytes(java.util.Base64.getDecoder().decode("MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCAv4C+7aHy52zIUZMW2bAJVb+f2A+E88wS9ep/vXJi6hg=="))
+        mfiDir.resolve("certificate.p7b").writeBytes(java.util.Base64.getDecoder().decode("MIICWwYJKoZIhvcNAQcCoIICTDCCAkgCAQExADALBgkqhkiG9w0BBwGgggIuMIICKjCCAdGgAwIBAgIQJKy7SGRvgHf3RjUjCFtg0jAKBggqhkjOPQQDAjCBiTELMAkGA1UEBhMCVVMxEzARBgNVBAoTCkFwcGxlIEluYy4xJjAkBgNVBAsTHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MT0wOwYDVQQDEzRBcHBsZSBBY2Nlc3NvcmllcyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eSAtIDAwMDAwMDAyMB4XDTE4MDYxMzA4MzI1OVoXDTQ5MTIzMTIzNTk1OVowbTELMAkGA1UEBhMCVVMxEzARBgNVBAoTCkFwcGxlIEluYy4xGjAYBgNVBAsTEUFwcGxlIEFjY2Vzc29yaWVzMS0wKwYDVQQDFCRJUEFfMjRBQ0JCNDg2NDZGODA3N0Y3NDYzNTIzMDg1QjYwRDIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAT0mPfItJFateYmSe89Z9Bpf4HwogWewlz3ZfUgQkbuxvuvw9vGmuyMlitYkr7QNJM9/J4shFRgN1GesptbVnEpozYwNDAyBgkqhkiG92NkBiQBAf8EIgQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIwCgYIKoZIzj0EAwIDRwAwRAIgaYL03y8Xje/EKdEqhBoRJLB071JCP69YmNOQXVv+qfkCIFngsPKacTAAVavi1E47l28ltIQslTc7ABuQ5c+lt47AoQAxAA=="))
+    }.canonicalFile
 
 android {
     namespace = "com.shilapi.xcertplay"
@@ -46,7 +50,7 @@ android {
             optimization {
                 enable = false
             }
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (providers.environmentVariable("ANDROID_KEYSTORE_PATH").isPresent) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
     }
     compileOptions {

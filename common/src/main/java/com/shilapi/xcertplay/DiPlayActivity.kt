@@ -376,11 +376,13 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Back on the home page finishes this activity while the session runs on, so the icon lands here.
-        if (savedInstanceState == null && isLauncherIntent(intent) && CarPlayBackgroundSession.hasSession()) {
+        if (savedInstanceState == null && isLauncherIntent(intent) && CarPlayBackgroundSession.hasSession() && LicenseManager.isLicensed(this)) {
             openProjection(); finish(); return
         }
         scheduleBackgroundUpdateChecks()
+        checkLicenseOnlineInBackground()
         availableUpdate = UpdateAvailability.available(this, version())
+        if (!LicenseManager.isLicensed(this)) page = "license"
         enforceInterfaceSize()
         refreshAppearance()
         rememberLaunchAppearance()
@@ -454,7 +456,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     private fun consumeBluetoothAutoConnectIntent(intent: Intent): Boolean {
         val requested = intent.getStringExtra(PhoneBluetoothReceiver.EXTRA_AUTO_CONNECT) == PhoneBluetoothReceiver.launchToken
         intent.removeExtra(PhoneBluetoothReceiver.EXTRA_AUTO_CONNECT)
-        return requested && DiPlayPreferences.connectOnPhoneBluetooth(this) &&
+        return requested && LicenseManager.isLicensed(this) && DiPlayPreferences.connectOnPhoneBluetooth(this) &&
             DiPlayPreferences.phoneAddress(this) != null && setupError == null &&
             !CarPlayBackgroundSession.hasSession()
     }
@@ -503,6 +505,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     override fun onStart() {
         super.onStart()
         // Results from the image picker and crop screens arrive before onResume.
+        if (!LicenseManager.isLicensed(this)) page = "license"
         enforceInterfaceSize()
         CenterMapOverlay.onDiPlayScreenShown()
         LauncherBubble.attach(this)
@@ -548,7 +551,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         if (initialLaunch) {
             initialLaunch = false
             startCarHotspotOnLaunch()
-            if (setupError == null && !CarPlayBackgroundSession.hasSession() &&
+            if (LicenseManager.isLicensed(this) && setupError == null && !CarPlayBackgroundSession.hasSession() &&
                 DiPlayPreferences.autoConnect(this) && requestedPage(intent) == null && page != "setup") {
                 handler.post { connect(DiPlayPreferences.autoConnectWireless(this)) }
             }
@@ -651,6 +654,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     private fun render() = render(appearanceOnly = false)
 
     private fun render(appearanceOnly: Boolean, preferredFocusTag: Any? = null) {
+        if (!LicenseManager.isLicensed(this)) page = "license"
         enforceInterfaceSize()
         refreshAppearance()
         applyWindowAppearance()
@@ -722,6 +726,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                 "setup" -> setupGuide(content)
                 "settings" -> settingsCategoryContent(content)
                 "backup" -> backup(content)
+                "license" -> licenseActivationScreen(content)
                 else -> home(content)
             }
             scroll
@@ -2506,6 +2511,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
 
     private fun about(content: LinearLayout) {
         settingsPageTitle(content, getString(R.string.about_diplay), getString(R.string.carplay_at_home_in_your_car))
+        licenseAboutSection(content)
         section(content, getString(R.string.about_public_preview_prefix, version())) { card ->
             card.addView(label(getString(R.string.an_independent_carplay_receiver_for_android_head_units_wir), 17, TEXT))
             card.addView(updateRow())
@@ -2525,6 +2531,227 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     private enum class UpdateStage { IDLE, CHECKING, AVAILABLE, DOWNLOADING, VERIFYING, READY, FAILED }
 
     private fun openBackup(from: SettingsCategory = SettingsCategory.ABOUT) {
+        backupOpenedFrom = from
+        page = "backup"
+        render()
+    }
+
+    private fun checkLicenseOnlineInBackground() {
+        if (LicenseManager.isTestEnvironment()) return
+        val app = applicationContext
+        Thread({
+            val wasValid = LicenseManager.state(app).isValid
+            val result = LicenseManager.verifyOnline(app)
+            if (result.success && result.licensed != wasValid) {
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (!result.licensed && CarPlayBackgroundSession.hasSession()) {
+                        CarPlayBackgroundSession.stop()
+                    }
+                    page = if (result.licensed) "home" else "license"
+                    render()
+                    toast(result.message)
+                }
+            }
+        }, "diplay-license-check").start()
+    }
+
+    private fun licenseAboutSection(content: LinearLayout) {
+        val st = LicenseManager.state(this)
+        val statusText = when (st.status) {
+            LicenseManager.Status.VALID_LIFETIME -> "Đã kích hoạt · Vĩnh viễn (Lifetime)"
+            LicenseManager.Status.VALID_TIMED ->
+                "Đã kích hoạt · Hết hạn: ${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
+            LicenseManager.Status.EXPIRED ->
+                "Đã hết hạn (${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)})"
+            LicenseManager.Status.REVOKED ->
+                "Đã thu hồi (${st.revokedReason ?: "Revoked"})"
+            LicenseManager.Status.UNLICENSED -> "Chưa kích hoạt (Unlicensed)"
+        }
+        section(content, "Bản quyền phần mềm · Software License") { card ->
+            card.addView(label("Trạng thái: $statusText", 16, if (st.isValid) READY else WARNING, true))
+            card.addView(label("Mã thiết bị (Device ID): ${st.deviceId}", 15, TEXT).apply {
+                setPadding(0, dp(6), 0, dp(10))
+            })
+            card.addView(actionButton("Quản lý / Đổi mã bản quyền (Manage License)", false) {
+                page = "license"
+                render()
+            }, matchButton(0, 60))
+        }
+    }
+
+    private fun licenseActivationScreen(content: LinearLayout) {
+        val compact = isCompactLayout
+        val st = LicenseManager.state(this)
+        val devId = st.deviceId
+        content.addView(label("Kích hoạt bản quyền DiPlay · License Activation", if (compact) 24 else 32, TEXT, true))
+        val statusLine = when (st.status) {
+            LicenseManager.Status.VALID_LIFETIME ->
+                "Trạng thái: Đã kích hoạt Vĩnh viễn (Lifetime License)"
+            LicenseManager.Status.VALID_TIMED ->
+                "Trạng thái: Đã kích hoạt đến ${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
+            LicenseManager.Status.EXPIRED ->
+                "Trạng thái: Mã bản quyền đã hết hạn vào ${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)}. Vui lòng nhập mã gia hạn mới."
+            LicenseManager.Status.REVOKED ->
+                "Trạng thái: Bản quyền đã bị thu hồi (${st.revokedReason ?: "Revoked"})."
+            LicenseManager.Status.UNLICENSED ->
+                "Vui lòng gửi Mã thiết bị bên dưới cho quản trị viên để nhận Mã kích hoạt (hoặc bấm Kích hoạt Online)."
+        }
+        content.addView(label(statusLine, 16, if (st.isValid) READY else WARNING, true).apply {
+            setPadding(0, dp(8), 0, dp(SETTINGS_BLOCK_GAP_DP))
+        })
+
+        val deviceCard = card().apply {
+            addView(label("MÃ THIẾT BỊ CỦA MÀN HÌNH XE (DEVICE ID)", 13, ACCENT, true).apply { letterSpacing = .08f })
+            addView(label(devId, if (compact) 24 else 30, TEXT, true).apply {
+                setPadding(0, dp(8), 0, dp(12))
+                setTextIsSelectable(true)
+            })
+            val qrSide = dp(if (compact) 150 else 180)
+            val qrView = ImageView(this@DiPlayActivity).apply {
+                setImageBitmap(SettingsQrCode.encode(devId, qrSide))
+                scaleType = ImageView.ScaleType.FIT_CENTER
+            }
+            addView(qrView, LinearLayout.LayoutParams(qrSide + dp(16), qrSide + dp(16)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(CONTROL_GAP_DP)
+            })
+            addView(actionButton("Sao chép Mã thiết bị (Copy ID)", false) {
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("DiPlay Device ID", devId))
+                toast("Đã sao chép Mã thiết bị: $devId")
+            }, matchButton(0, if (compact) 52 else 60))
+        }
+
+        val keyInput = EditText(this).apply {
+            setSingleLine()
+            hint = "XXXX-XXXX-XXXX-XXXX"
+            textSize = if (compact) 18f else 20f
+            setTextColor(TEXT)
+            setHintTextColor(MUTED)
+            background = buttonShape(BUTTON, BORDER)
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+                android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            st.licenseKey?.takeIf { it != "ONLINE" }?.let(::setText)
+        }
+
+        val activateCard = card().apply {
+            addView(label("NHẬP MÃ KÍCH HOẠT (16 KÝ TỰ)", 13, ACCENT, true).apply { letterSpacing = .08f })
+            addView(label("Hỗ trợ mã kích hoạt Offline theo thiết bị (Vĩnh viễn hoặc Có thời hạn) không cần mạng Internet.", 14, MUTED).apply {
+                setPadding(0, dp(6), 0, dp(12))
+            })
+            addView(keyInput, LinearLayout.LayoutParams(-1, dp(if (compact) 54 else 62)).apply {
+                bottomMargin = dp(CONTROL_GAP_DP)
+            })
+            addView(actionButton("Kích hoạt bằng Mã (Activate Key)", true) {
+                val entered = keyInput.text?.toString().orEmpty().trim()
+                if (entered.isEmpty()) {
+                    toast("Vui lòng nhập Mã kích hoạt 16 ký tự")
+                    return@actionButton
+                }
+                val parsed = LicenseManager.verifyKeyForDevice(entered, devId)
+                if (parsed == null) {
+                    toast("Mã kích hoạt không hợp lệ hoặc không đúng với Mã thiết bị $devId")
+                    return@actionButton
+                }
+                val updated = LicenseManager.activateOffline(this@DiPlayActivity, entered)
+                if (updated.isValid) {
+                    val expMsg = if (updated.expiresAtEpochMs == null) "Vĩnh viễn"
+                    else "Hạn dùng đến ${LicenseManager.formatExpiryDate(updated.expiresAtEpochMs)}"
+                    toast("Kích hoạt thành công ($expMsg)!")
+                    page = "home"
+                    render()
+                } else {
+                    toast("Mã kích hoạt này đã hết hạn vào ${LicenseManager.formatExpiryDate(updated.expiresAtEpochMs)}")
+                    render()
+                }
+            }, matchButton(0, if (compact) 54 else 64))
+
+            addView(actionButton("Kích hoạt / Kiểm tra Online (Online Check)", false) {
+                toast("Đang kiểm tra bản quyền trên máy chủ...")
+                val app = applicationContext
+                Thread({
+                    val res = LicenseManager.verifyOnline(app)
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        toast(res.message)
+                        if (res.licensed) {
+                            page = "home"
+                        }
+                        render()
+                    }
+                }, "diplay-license-manual-online").start()
+            }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+
+            addView(actionButton("Cấu hình Máy chủ Online (Server URL)", false) {
+                showOnlineServerDialog()
+            }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+
+            if (st.isValid) {
+                addView(actionButton("Vào màn hình chính CarPlay (Open Home)", false) {
+                    page = "home"
+                    render()
+                }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+                addView(actionButton("Xóa mã bản quyền trên xe này (Deactivate)", false) {
+                    appDialogBuilder()
+                        .setTitle("Xóa bản quyền?")
+                        .setMessage("Bạn có chắc muốn xóa mã kích hoạt hiện tại khỏi thiết bị này không?")
+                        .setPositiveButton("Xóa") { _, _ ->
+                            LicenseManager.clearLicense(this@DiPlayActivity)
+                            if (CarPlayBackgroundSession.hasSession()) CarPlayBackgroundSession.stop()
+                            page = "license"
+                            render()
+                        }
+                        .setNegativeButton(getString(R.string.cancel), null)
+                        .show()
+                }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+            }
+        }
+
+        val wide = resources.configuration.screenWidthDp >= 850
+        if (wide) {
+            content.addView(row().apply {
+                gravity = Gravity.TOP
+                addView(deviceCard, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(space(24), LinearLayout.LayoutParams(dp(24), 1))
+                addView(activateCard, LinearLayout.LayoutParams(0, -2, 1.3f))
+            })
+        } else {
+            content.addView(deviceCard, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+            })
+            content.addView(activateCard)
+        }
+    }
+
+    private fun showOnlineServerDialog() {
+        val input = EditText(this).apply {
+            setSingleLine()
+            setText(LicenseManager.onlineServerUrl(this@DiPlayActivity))
+            hint = LicenseManager.DEFAULT_ONLINE_LICENSE_URL
+            setTextColor(TEXT)
+            setHintTextColor(MUTED)
+            setPadding(dp(20), dp(14), dp(20), dp(14))
+        }
+        appDialogBuilder()
+            .setTitle("Máy chủ License Online (JSON / REST API)")
+            .setView(input)
+            .setPositiveButton(getString(R.string.save)) { _, _ ->
+                LicenseManager.saveOnlineServerUrl(this, input.text?.toString().orEmpty())
+                toast("Đã lưu địa chỉ máy chủ License Online")
+            }
+            .setNeutralButton("Mặc định") { _, _ ->
+                LicenseManager.saveOnlineServerUrl(this, "")
+                toast("Đã khôi phục URL mặc định")
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
         backupOpenedFrom = from
         page = "backup"
         render()
@@ -5728,6 +5955,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     }
 
     private fun connect(wireless: Boolean) {
+        if (!LicenseManager.isLicensed(this)) { page = "license"; render(); return }
         startupHotspotCancelled = true
         if (wireless && pendingCarHotspotSetup) { toast(getString(R.string.save_your_hotspot_details_in_connection_setup_first)); page = "connection"; render(); return }
         if (setupError != null) { toast(setupError!!); return }

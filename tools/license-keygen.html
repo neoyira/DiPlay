@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DiPlay Admin License Keygen</title>
+  <style>
+    :root {
+      --bg: #0f141c;
+      --surface: #18202c;
+      --border: #2a3548;
+      --accent: #3b82f6;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --success: #22c55e;
+    }
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body {
+      margin: 0; padding: 24px;
+      background: var(--bg); color: var(--text);
+      display: flex; justify-content: center;
+    }
+    .container { max-width: 680px; width: 100%; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    p.sub { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+    label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .05em; }
+    input, select, textarea {
+      width: 100%; padding: 12px 14px;
+      border-radius: 12px; border: 1px solid var(--border);
+      background: #0b0f17; color: var(--text);
+      font-size: 16px;
+    }
+    .presets { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .presets button {
+      flex: 1; min-width: 100px; padding: 9px 12px;
+      border-radius: 10px; border: 1px solid var(--border);
+      background: #1e293b; color: var(--text); cursor: pointer; font-weight: 600;
+    }
+    .presets button.active { background: var(--accent); border-color: var(--accent); }
+    button.primary {
+      width: 100%; margin-top: 20px; padding: 14px;
+      border-radius: 12px; border: none;
+      background: var(--accent); color: white;
+      font-size: 16px; font-weight: 700; cursor: pointer;
+    }
+    .output-box {
+      margin-top: 18px; padding: 18px;
+      border-radius: 14px; border: 1px dashed var(--accent);
+      background: #0b0f17; text-align: center;
+    }
+    .key-text {
+      font-size: 26px; font-weight: 800; letter-spacing: 2px;
+      color: var(--success); margin: 8px 0; user-select: all;
+    }
+    pre {
+      background: #0b0f17; padding: 14px; border-radius: 12px;
+      border: 1px solid var(--border); overflow-x: auto;
+      font-size: 13px; color: #cbd5e1;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>DiPlay License Keygen (Admin)</h1>
+      <p class="sub">Tạo mã kích hoạt Offline 16 ký tự & cấu hình Online JSON cho màn hình xe BYD</p>
+
+      <label>Mã thiết bị trên màn hình xe (Device ID - 12 ký tự, hoặc * cho mọi máy)</label>
+      <input id="deviceId" type="text" placeholder="VD: 8F3A-9C2E-4B1D hoặc *" value="" />
+
+      <label>Thời hạn bản quyền</label>
+      <div class="presets">
+        <button type="button" onclick="setPreset('lifetime', this)" class="active">Vĩnh viễn (Lifetime)</button>
+        <button type="button" onclick="setPreset(7, this)">7 Ngày (Trial)</button>
+        <button type="button" onclick="setPreset(30, this)">30 Ngày</button>
+        <button type="button" onclick="setPreset(365, this)">1 Năm</button>
+      </div>
+
+      <label>Ngày hết hạn (Để trống = Vĩnh viễn)</label>
+      <input id="expiryDate" type="date" />
+
+      <label>Ghi chú khách hàng (Tùy chọn cho file licenses.json)</label>
+      <input id="note" type="text" placeholder="VD: BYD Atto 3 - Anh Minh (090xxxxxxx)" />
+
+      <button class="primary" onclick="generate()">Tạo Mã Kích Hoạt (Generate Key)</button>
+
+      <div id="resultArea" class="output-box" style="display:none;">
+        <div style="font-size:12px;color:var(--muted);">MÃ KÍCH HOẠT OFFLINE (16 KÝ TỰ)</div>
+        <div id="keyOutput" class="key-text"></div>
+        <div id="metaOutput" style="font-size:13px;color:var(--muted);margin-bottom:10px;"></div>
+        <button type="button" onclick="copyKey()" style="padding:8px 16px;border-radius:8px;border:1px solid var(--border);background:#1e293b;color:white;cursor:pointer;">Sao chép Mã kích hoạt</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <label style="margin-top:0;">Đoạn cấu hình cho file licenses.json (Kích hoạt Online 1 chạm)</label>
+      <pre id="jsonOutput">// Nhấn "Tạo Mã Kích Hoạt" để tạo đoạn JSON</pre>
+    </div>
+  </div>
+
+  <script>
+    const ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const EPOCH_2025_MS = 1735689600000;
+    const LIFETIME_DAYS = 0xFFFF;
+
+    function normalizeCode(str) {
+      return (str || "").toUpperCase().replace(/[0O]/g, "2").replace(/[1I]/g, "L")
+        .split("").filter(c => ALPHABET.includes(c)).join("");
+    }
+
+    function formatChunks(str, len) {
+      const clean = normalizeCode(str).slice(0, len);
+      return clean.match(/.{1,4}/g)?.join("-") || "";
+    }
+
+    function setPreset(mode, btn) {
+      document.querySelectorAll(".presets button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      const dateInput = document.getElementById("expiryDate");
+      if (mode === "lifetime") {
+        dateInput.value = "";
+      } else {
+        const d = new Date(Date.now() + mode * 86400000);
+        dateInput.value = d.toISOString().slice(0, 10);
+      }
+    }
+
+    function signingSecretBytes() {
+      const partA = [0x44, 0x69, 0x50, 0x6C, 0x61, 0x79, 0x2D, 0x4E, 0x65, 0x6F, 0x59, 0x69, 0x72, 0x61, 0x2D, 0x53];
+      const partB = [0x65, 0x63, 0x72, 0x65, 0x74, 0x2D, 0x32, 0x30, 0x32, 0x36, 0x2D, 0x56, 0x31, 0x2D, 0x4B, 0x39];
+      const out = new Uint8Array(32);
+      for (let i = 0; i < 16; i++) out[i] = partA[i] ^ 0x5A;
+      for (let i = 0; i < 16; i++) out[16 + i] = partB[i] ^ 0xA5;
+      return out;
+    }
+
+    function encodeBase32(bytes) {
+      let out = "";
+      let buffer = 0;
+      let bitsLeft = 0;
+      for (const b of bytes) {
+        buffer = (buffer << 8) | (b & 0xFF);
+        bitsLeft += 8;
+        while (bitsLeft >= 5) {
+          const index = (buffer >>> (bitsLeft - 5)) & 0x1F;
+          out += ALPHABET[index];
+          bitsLeft -= 5;
+        }
+      }
+      if (bitsLeft > 0) {
+        const index = (buffer << (5 - bitsLeft)) & 0x1F;
+        out += ALPHABET[index];
+      }
+      return out;
+    }
+
+    async function computeDeviceTag(cleanDevice) {
+      const data = new TextEncoder().encode("DIPLAY-DEV:" + cleanDevice);
+      const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+      const tag = ((hash[0] & 0xFF) << 8) | (hash[1] & 0xFF);
+      return tag === 0 ? 1 : tag;
+    }
+
+    async function generate() {
+      const rawInput = document.getElementById("deviceId").value.trim();
+      const universal = rawInput === "*";
+      const cleanDevice = universal ? "" : normalizeCode(rawInput);
+      if (!universal && cleanDevice.length !== 12) {
+        alert("Mã thiết bị phải đủ 12 ký tự (VD: 8F3A-9C2E-4B1D) hoặc nhập * để tạo mã dùng chung!");
+        return;
+      }
+      const dateStr = document.getElementById("expiryDate").value;
+      let expiryDays = LIFETIME_DAYS;
+      if (dateStr) {
+        const ms = Date.parse(dateStr + "T00:00:00Z");
+        expiryDays = Math.floor((ms - EPOCH_2025_MS) / 86400000);
+        if (expiryDays < 1 || expiryDays >= LIFETIME_DAYS) {
+          alert("Ngày hết hạn phải sau 2025-01-01!");
+          return;
+        }
+      }
+
+      const deviceTag = universal ? 0 : await computeDeviceTag(cleanDevice);
+      const payload = new Uint8Array([
+        (deviceTag >>> 8) & 0xFF,
+        deviceTag & 0xFF,
+        (expiryDays >>> 8) & 0xFF,
+        expiryDays & 0xFF
+      ]);
+
+      const key = await crypto.subtle.importKey(
+        "raw", signingSecretBytes(), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+      );
+      const targetBytes = new TextEncoder().encode(universal ? "UNIVERSAL" : cleanDevice);
+      const hmacInput = new Uint8Array(payload.length + targetBytes.length);
+      hmacInput.set(payload, 0);
+      hmacInput.set(targetBytes, payload.length);
+      const sigFull = new Uint8Array(await crypto.subtle.sign("HMAC", key, hmacInput));
+      const sig = sigFull.slice(0, 6);
+
+      const raw = new Uint8Array(10);
+      for (let i = 0; i < 4; i++) raw[i] = payload[i] ^ sig[i];
+      for (let i = 0; i < 6; i++) raw[4 + i] = sig[i];
+
+      const formattedKey = formatChunks(encodeBase32(raw), 16);
+      const formattedDev = universal ? "* (Mọi thiết bị)" : formatChunks(cleanDevice, 12);
+
+      document.getElementById("resultArea").style.display = "block";
+      document.getElementById("keyOutput").textContent = formattedKey;
+      document.getElementById("metaOutput").textContent =
+        `Thiết bị: ${formattedDev} · Thời hạn: ${dateStr ? dateStr : "Vĩnh viễn (Lifetime)"}`;
+
+      const note = document.getElementById("note").value.trim() || "Khách hàng DiPlay";
+      const jsonKey = universal ? "UNIVERSAL" : formatChunks(cleanDevice, 12);
+      const snippet = {
+        [jsonKey]: {
+          status: "active",
+          expires: dateStr ? dateStr : "lifetime",
+          key: formattedKey,
+          note: note
+        }
+      };
+      document.getElementById("jsonOutput").textContent = JSON.stringify(snippet, null, 2);
+    }
+
+    function copyKey() {
+      const k = document.getElementById("keyOutput").textContent;
+      navigator.clipboard.writeText(k);
+      alert("Đã sao chép: " + k);
+    }
+  </script>
+</body>
+</html>
