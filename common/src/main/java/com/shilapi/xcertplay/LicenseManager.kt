@@ -2,10 +2,13 @@
 package com.shilapi.xcertplay
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.os.Build
 import android.provider.Settings
+import com.shilapi.xcertplay.update.InternetNetworkSelector
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
@@ -13,6 +16,7 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
+import java.util.Base64
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -21,23 +25,39 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.ceil
 
 /**
- * Hybrid Offline + Online License Manager for DiPlay.
+ * License Manager for DiPlay integrated with https://licenses.mewit.vn:
  *
- * - Generates a deterministic 12-character Device ID (`XXXX-XXXX-XXXX`) per head unit.
- * - Verifies 16-character Offline License Keys (`XXXX-XXXX-XXXX-XXXX`) with embedded expiration
- *   date (or Lifetime `0xFFFF`) and HMAC-SHA256 cryptographic authentication.
- * - Supports Online License activation/revocation against a remote JSON/REST endpoint.
- * - Protects time-limited licenses against system clock rollback.
+ * 1. Primary Activation (Binds Device ID on first call & caches signed Ed25519 payload):
+ *    `POST https://licenses.mewit.vn/activate_mewremote.php`
+ *    Body: `{"license_key": "...", "device_id": "...", "device_label": "...", "product": "diplay"}`
+ *
+ * 2. Fast Status Verification (Checks validity, expiration, revocation & device match without claiming slot):
+ *    `GET https://licenses.mewit.vn/get_license.php?license_key=...&product=diplay&device_id=...`
+ *
+ * 3. Offline Cached Execution & Offline Fallback Key:
+ *    - Once activated online via `activate_mewremote.php`, the activation record (`expiry_date`,
+ *      `payload_base64`, `signature_base64`) is sealed to the head unit's hardware ID so CarPlay
+ *      starts immediately even when the car is in an underground garage without internet.
+ *    - Whenever internet is available, `get_license.php` is queried in the background to sync
+ *      expiration extensions or lock the app if the key was revoked or moved to another device.
  */
 object LicenseManager {
+    const val PRODUCT_ID = "diplay"
+    const val ACTIVATE_ENDPOINT = "https://licenses.mewit.vn/activate_mewremote.php"
+    const val CHECK_ENDPOINT = "https://licenses.mewit.vn/get_license.php"
+
     private const val PREFS = "diplay_license"
     private const val KEY_LICENSE_CODE = "license_code"
-    private const val KEY_ONLINE_EXPIRY_DAYS = "online_expiry_days"
-    private const val KEY_ONLINE_VERIFIED_DEVICE = "online_verified_device"
+    private const val KEY_EXPIRY_DATE_STR = "expiry_date_str"
+    private const val KEY_EXPIRY_DAYS = "online_expiry_days"
+    private const val KEY_VERIFIED_DEVICE = "online_verified_device"
+    private const val KEY_PAYLOAD_B64 = "payload_base64"
+    private const val KEY_SIGNATURE_B64 = "signature_base64"
+    private const val KEY_USERNAME = "license_username"
+    private const val KEY_CACHE_SEAL = "license_cache_seal"
     private const val KEY_REVOKED = "license_revoked"
     private const val KEY_REVOKED_REASON = "license_revoked_reason"
     private const val KEY_LAST_SEEN_EPOCH_MS = "last_seen_epoch_ms"
-    private const val KEY_ONLINE_SERVER_URL = "online_server_url"
     private const val KEY_CACHED_DEVICE_ID = "cached_device_id"
 
     /** Base epoch for expiration day calculation: 2025-01-01 00:00:00 UTC. */
@@ -45,13 +65,6 @@ object LicenseManager {
     const val LIFETIME_EXPIRY_DAYS = 0xFFFF
     private const val DAY_MS = 86_400_000L
     private const val ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-
-    /**
-     * Default remote JSON/API endpoint for 1-click online activation & revocation.
-     * Can also be overridden in UI settings.
-     */
-    const val DEFAULT_ONLINE_LICENSE_URL =
-        "https://raw.githubusercontent.com/neoyira/DiPlay/main/licenses.json"
 
     /**
      * In Robolectric unit tests, existing UI tests expect the main screen unless a test explicitly
@@ -76,7 +89,9 @@ object LicenseManager {
         val deviceId: String,
         val licenseKey: String?,
         val expiresAtEpochMs: Long?,
+        val expiryDateText: String?,
         val daysRemaining: Int?,
+        val username: String? = null,
         val revokedReason: String? = null,
         val isOnlineActivated: Boolean = false,
     ) {
@@ -94,14 +109,15 @@ object LicenseManager {
         val isLifetime: Boolean get() = expiryDays == LIFETIME_EXPIRY_DAYS
     }
 
-    data class OnlineCheckResult(
+    data class ApiResult(
         val success: Boolean,
+        val httpCode: Int,
         val licensed: Boolean,
         val message: String,
         val state: LicenseState,
     )
 
-    // Obfuscated signing secret so simple string scans on the APK do not reveal the HMAC key.
+    // Obfuscated signing secret for local cache seal and offline fallback keys.
     private fun signingSecret(): ByteArray {
         val partA = intArrayOf(
             0x44, 0x69, 0x50, 0x6C, 0x61, 0x79, 0x2D, 0x4E,
@@ -115,6 +131,14 @@ object LicenseManager {
         for (i in partA.indices) out[i] = (partA[i] xor 0x5A).toByte()
         for (i in partB.indices) out[partA.size + i] = (partB[i] xor 0xA5).toByte()
         return out
+    }
+
+    private fun openHttpConnection(context: Context, urlString: String): HttpURLConnection {
+        val url = URL(urlString)
+        val network = runCatching {
+            context.getSystemService(ConnectivityManager::class.java)?.let(InternetNetworkSelector::select)
+        }.getOrNull()
+        return ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection)
     }
 
     private fun prefs(context: Context) =
@@ -153,6 +177,20 @@ object LicenseManager {
         return formatted
     }
 
+    /**
+     * Human-readable label of the car head unit sent in `device_label`.
+     */
+    fun deviceLabel(): String {
+        val manufacturer = Build.MANUFACTURER?.trim().orEmpty()
+        val model = Build.MODEL?.trim().orEmpty()
+        val headUnit = when {
+            manufacturer.isEmpty() && model.isEmpty() -> "Android Head Unit"
+            model.startsWith(manufacturer, ignoreCase = true) -> model
+            else -> "$manufacturer $model".trim()
+        }
+        return "$headUnit (Android ${Build.VERSION.RELEASE ?: Build.VERSION.SDK_INT})"
+    }
+
     fun normalizeCode(input: String): String =
         input.uppercase(Locale.US)
             .replace("0", "2")
@@ -169,6 +207,20 @@ object LicenseManager {
     fun formatLicenseKey(raw: String): String {
         val clean = normalizeCode(raw).take(16)
         return clean.chunked(4).joinToString("-")
+    }
+
+    private fun computeCacheSeal(
+        cleanDeviceId: String,
+        licenseKey: String,
+        expiryDays: Int,
+        payloadB64: String,
+        signatureB64: String,
+    ): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(signingSecret(), "HmacSHA256"))
+        val data = "$cleanDeviceId|$licenseKey|$expiryDays|$payloadB64|$signatureB64|$PRODUCT_ID"
+        val bytes = mac.doFinal(data.toByteArray(StandardCharsets.UTF_8))
+        return Base64.getEncoder().encodeToString(bytes)
     }
 
     internal fun computeDeviceTag(normalizedDeviceId: String): Int {
@@ -188,12 +240,6 @@ object LicenseManager {
         return mac.doFinal().copyOfRange(0, 6)
     }
 
-    /**
-     * Generates a 16-character offline license key (`XXXX-XXXX-XXXX-XXXX`).
-     *
-     * @param targetDeviceId 12-character device ID, or `"*"` / `""` for a universal key.
-     * @param expiryDays [LIFETIME_EXPIRY_DAYS] (`65535`) for lifetime, or days since 2025-01-01 UTC.
-     */
     fun generateLicenseKey(
         targetDeviceId: String,
         expiryDays: Int = LIFETIME_EXPIRY_DAYS,
@@ -220,34 +266,38 @@ object LicenseManager {
         return formatLicenseKey(encodeBase32(raw))
     }
 
-    /**
-     * Generates a license key that expires at the end of the given `yyyy-MM-dd` UTC date.
-     */
     fun generateLicenseKeyForDate(targetDeviceId: String, utcDateYmd: String): String {
         val days = dateToExpiryDays(utcDateYmd)
         return generateLicenseKey(targetDeviceId, days)
     }
 
     fun dateToExpiryDays(utcDateYmd: String): Int {
+        val cleanDate = utcDateYmd.trim().take(10)
         val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
             isLenient = false
         }
-        val parsed = sdf.parse(utcDateYmd.trim()) ?: error("Invalid date: $utcDateYmd")
+        val parsed = sdf.parse(cleanDate) ?: error("Invalid date: $utcDateYmd")
         val diffDays = ((parsed.time - EPOCH_2025_01_01_MS) / DAY_MS).toInt()
         require(diffDays in 1 until LIFETIME_EXPIRY_DAYS) { "Expiry date must be after 2025-01-01" }
         return diffDays
     }
 
+    fun parseExpiryDaysOrLifetime(expiryStr: String?): Int {
+        val trimmed = expiryStr?.trim()?.lowercase(Locale.US).orEmpty()
+        if (trimmed.isEmpty() || trimmed == "null" || trimmed == "lifetime" ||
+            trimmed == "permanent" || trimmed == "never" || trimmed.startsWith("9999")
+        ) {
+            return LIFETIME_EXPIRY_DAYS
+        }
+        return runCatching { dateToExpiryDays(trimmed) }.getOrDefault(LIFETIME_EXPIRY_DAYS)
+    }
+
     fun expiryDaysToEpochMs(expiryDays: Int): Long? {
         if (expiryDays == LIFETIME_EXPIRY_DAYS) return null
-        // Valid through the end of the expiration day (23:59:59.999 UTC).
         return EPOCH_2025_01_01_MS + (expiryDays.toLong() + 1L) * DAY_MS - 1L
     }
 
-    /**
-     * Verifies whether [licenseKey] is cryptographically valid for [deviceId].
-     */
     fun verifyKeyForDevice(licenseKey: String, deviceId: String): ParsedKey? {
         val cleanKey = normalizeCode(licenseKey)
         if (cleanKey.length != 16) return null
@@ -294,19 +344,79 @@ object LicenseManager {
      */
     fun state(context: Context, nowMs: Long = System.currentTimeMillis()): LicenseState {
         val devId = deviceId(context)
+        val cleanDev = normalizeCode(devId)
         val p = prefs(context)
+        val storedKey = p.getString(KEY_LICENSE_CODE, null)
+        val username = p.getString(KEY_USERNAME, null)
+        val expiryDateStr = p.getString(KEY_EXPIRY_DATE_STR, null)
+
         if (p.getBoolean(KEY_REVOKED, false)) {
             return LicenseState(
                 status = Status.REVOKED,
                 deviceId = devId,
-                licenseKey = p.getString(KEY_LICENSE_CODE, null),
+                licenseKey = storedKey,
                 expiresAtEpochMs = null,
+                expiryDateText = expiryDateStr,
                 daysRemaining = 0,
+                username = username,
                 revokedReason = p.getString(KEY_REVOKED_REASON, null),
             )
         }
+
         val effectiveNow = effectiveNowMs(context, nowMs)
-        val storedKey = p.getString(KEY_LICENSE_CODE, null)
+
+        // 1. Check MEWIT Online Activated Cache (sealed to this device)
+        val onlineVerifiedDevice = p.getString(KEY_VERIFIED_DEVICE, null)
+        val onlineExpiryDays = p.getInt(KEY_EXPIRY_DAYS, 0)
+        val payloadB64 = p.getString(KEY_PAYLOAD_B64, "").orEmpty()
+        val signatureB64 = p.getString(KEY_SIGNATURE_B64, "").orEmpty()
+        val storedSeal = p.getString(KEY_CACHE_SEAL, "").orEmpty()
+
+        if (!storedKey.isNullOrBlank() && onlineVerifiedDevice == cleanDev && onlineExpiryDays > 0) {
+            val expectedSeal = computeCacheSeal(cleanDev, storedKey, onlineExpiryDays, payloadB64, signatureB64)
+            if (storedSeal == expectedSeal) {
+                val expiresAt = expiryDaysToEpochMs(onlineExpiryDays)
+                if (expiresAt == null) {
+                    return LicenseState(
+                        status = Status.VALID_LIFETIME,
+                        deviceId = devId,
+                        licenseKey = storedKey,
+                        expiresAtEpochMs = null,
+                        expiryDateText = expiryDateStr ?: "Vĩnh viễn",
+                        daysRemaining = null,
+                        username = username,
+                        isOnlineActivated = true,
+                    )
+                }
+                val remainingMs = expiresAt - effectiveNow
+                return if (remainingMs >= 0L) {
+                    val daysLeft = ceil(remainingMs.toDouble() / DAY_MS.toDouble()).toInt().coerceAtLeast(1)
+                    LicenseState(
+                        status = Status.VALID_TIMED,
+                        deviceId = devId,
+                        licenseKey = storedKey,
+                        expiresAtEpochMs = expiresAt,
+                        expiryDateText = expiryDateStr ?: formatExpiryDate(expiresAt),
+                        daysRemaining = daysLeft,
+                        username = username,
+                        isOnlineActivated = true,
+                    )
+                } else {
+                    LicenseState(
+                        status = Status.EXPIRED,
+                        deviceId = devId,
+                        licenseKey = storedKey,
+                        expiresAtEpochMs = expiresAt,
+                        expiryDateText = expiryDateStr ?: formatExpiryDate(expiresAt),
+                        daysRemaining = 0,
+                        username = username,
+                        isOnlineActivated = true,
+                    )
+                }
+            }
+        }
+
+        // 2. Check Offline Cryptographic Key (16-char fallback)
         if (!storedKey.isNullOrBlank()) {
             val parsed = verifyKeyForDevice(storedKey, devId)
             if (parsed != null) {
@@ -317,6 +427,7 @@ object LicenseManager {
                         deviceId = devId,
                         licenseKey = parsed.formattedKey,
                         expiresAtEpochMs = null,
+                        expiryDateText = "Vĩnh viễn",
                         daysRemaining = null,
                     )
                 }
@@ -328,63 +439,28 @@ object LicenseManager {
                         deviceId = devId,
                         licenseKey = parsed.formattedKey,
                         expiresAtEpochMs = expiresAt,
+                        expiryDateText = formatExpiryDate(expiresAt),
                         daysRemaining = daysLeft,
                     )
                 } else {
-                    LicenseState(
+                    return LicenseState(
                         status = Status.EXPIRED,
                         deviceId = devId,
                         licenseKey = parsed.formattedKey,
                         expiresAtEpochMs = expiresAt,
+                        expiryDateText = formatExpiryDate(expiresAt),
                         daysRemaining = 0,
                     )
                 }
             }
         }
 
-        // Check online activation record if present
-        val onlineVerifiedDevice = p.getString(KEY_ONLINE_VERIFIED_DEVICE, null)
-        val onlineExpiryDays = p.getInt(KEY_ONLINE_EXPIRY_DAYS, 0)
-        if (onlineVerifiedDevice == normalizeCode(devId) && onlineExpiryDays > 0) {
-            val expiresAt = expiryDaysToEpochMs(onlineExpiryDays)
-            if (expiresAt == null) {
-                return LicenseState(
-                    status = Status.VALID_LIFETIME,
-                    deviceId = devId,
-                    licenseKey = "ONLINE",
-                    expiresAtEpochMs = null,
-                    daysRemaining = null,
-                    isOnlineActivated = true,
-                )
-            }
-            val remainingMs = expiresAt - effectiveNow
-            return if (remainingMs >= 0L) {
-                val daysLeft = ceil(remainingMs.toDouble() / DAY_MS.toDouble()).toInt().coerceAtLeast(1)
-                LicenseState(
-                    status = Status.VALID_TIMED,
-                    deviceId = devId,
-                    licenseKey = "ONLINE",
-                    expiresAtEpochMs = expiresAt,
-                    daysRemaining = daysLeft,
-                    isOnlineActivated = true,
-                )
-            } else {
-                LicenseState(
-                    status = Status.EXPIRED,
-                    deviceId = devId,
-                    licenseKey = "ONLINE",
-                    expiresAtEpochMs = expiresAt,
-                    daysRemaining = 0,
-                    isOnlineActivated = true,
-                )
-            }
-        }
-
         return LicenseState(
             status = Status.UNLICENSED,
             deviceId = devId,
-            licenseKey = null,
+            licenseKey = storedKey,
             expiresAtEpochMs = null,
+            expiryDateText = null,
             daysRemaining = null,
         )
     }
@@ -398,7 +474,7 @@ object LicenseManager {
     }
 
     /**
-     * Attempts to activate with an offline license key.
+     * Activates using an offline 16-character cryptographic key (`XXXX-XXXX-XXXX-XXXX`).
      */
     fun activateOffline(
         context: Context,
@@ -416,6 +492,7 @@ object LicenseManager {
                 deviceId = devId,
                 licenseKey = parsed.formattedKey,
                 expiresAtEpochMs = expiresAt,
+                expiryDateText = formatExpiryDate(expiresAt),
                 daysRemaining = 0,
             )
         }
@@ -427,179 +504,361 @@ object LicenseManager {
         return state(context, nowMs)
     }
 
-    fun clearLicense(context: Context) {
-        prefs(context).edit()
-            .remove(KEY_LICENSE_CODE)
-            .remove(KEY_ONLINE_EXPIRY_DAYS)
-            .remove(KEY_ONLINE_VERIFIED_DEVICE)
-            .remove(KEY_REVOKED)
-            .remove(KEY_REVOKED_REASON)
-            .apply()
+    /**
+     * 1. Check & Activate Device via `POST https://licenses.mewit.vn/activate_mewremote.php`
+     * Automatically binds `device_id`, checks expiration & `product = "diplay"`, and caches
+     * the Ed25519 signed payload. Falls back to offline key verification if the key is a valid
+     * 16-character offline key and no network is available.
+     */
+    fun activateWithServer(
+        context: Context,
+        rawLicenseKey: String,
+        endpointUrl: String = ACTIVATE_ENDPOINT,
+        timeoutMs: Int = 10_000,
+    ): ApiResult {
+        val keyInput = rawLicenseKey.trim().uppercase(Locale.US)
+        val devId = deviceId(context)
+        if (keyInput.isEmpty()) {
+            return ApiResult(
+                success = false,
+                httpCode = 0,
+                licensed = isLicensed(context),
+                message = "Vui lòng nhập Mã bản quyền (License Key).",
+                state = state(context),
+            )
+        }
+
+        return try {
+            val requestBody = JSONObject().apply {
+                put("license_key", keyInput)
+                put("device_id", devId)
+                put("device_label", deviceLabel())
+                put("product", PRODUCT_ID)
+            }.toString()
+
+            val connection = openHttpConnection(context, endpointUrl).apply {
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                requestMethod = "POST"
+                doOutput = true
+                useCaches = false
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "DiPlay-Android/1.0")
+            }
+            connection.outputStream.use { os ->
+                os.write(requestBody.toByteArray(StandardCharsets.UTF_8))
+            }
+
+            val code = connection.responseCode
+            val stream: InputStream? = if (code in 200..299) connection.inputStream else connection.errorStream
+            val body = stream?.let {
+                BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).use(BufferedReader::readText)
+            }.orEmpty()
+
+            handleActivateResponse(context, keyInput, code, body, devId)
+        } catch (networkError: Throwable) {
+            // If offline, check if the entered key is a valid local 16-char offline key for this device
+            val offlineParsed = verifyKeyForDevice(keyInput, devId)
+            if (offlineParsed != null) {
+                val st = activateOffline(context, keyInput)
+                return ApiResult(
+                    success = st.isValid,
+                    httpCode = 200,
+                    licensed = st.isValid,
+                    message = if (st.isValid) "Đã kích hoạt Offline thành công!" else "Mã kích hoạt đã hết hạn.",
+                    state = st,
+                )
+            }
+            ApiResult(
+                success = false,
+                httpCode = -1,
+                licensed = isLicensed(context),
+                message = "Không thể kết nối máy chủ kích hoạt (${networkError.localizedMessage ?: networkError.javaClass.simpleName}). Kiểm tra kết nối Wi-Fi/4G của xe.",
+                state = state(context),
+            )
+        }
     }
 
-    fun onlineServerUrl(context: Context): String =
-        prefs(context).getString(KEY_ONLINE_SERVER_URL, null)
-            ?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_ONLINE_LICENSE_URL
+    internal fun handleActivateResponse(
+        context: Context,
+        licenseKey: String,
+        httpCode: Int,
+        body: String,
+        devId: String = deviceId(context),
+    ): ApiResult {
+        val cleanDev = normalizeCode(devId)
+        val json = runCatching { JSONObject(body) }.getOrNull()
+        val serverError = json?.optString("error", "")?.takeIf { it.isNotBlank() }
+            ?: json?.optString("message", "")?.takeIf { it.isNotBlank() }
 
-    fun saveOnlineServerUrl(context: Context, url: String) {
-        val trimmed = url.trim()
-        prefs(context).edit().apply {
-            if (trimmed.isEmpty() || trimmed == DEFAULT_ONLINE_LICENSE_URL) remove(KEY_ONLINE_SERVER_URL)
-            else putString(KEY_ONLINE_SERVER_URL, trimmed)
-        }.apply()
+        when (httpCode) {
+            200 -> {
+                val ok = json?.optBoolean("ok", false) ?: false
+                if (!ok) {
+                    val msg = serverError ?: "Kích hoạt không thành công."
+                    return ApiResult(false, 200, isLicensed(context), msg, state(context))
+                }
+                val product = json?.optString("product", PRODUCT_ID).orEmpty()
+                if (product.isNotEmpty() && !product.equals(PRODUCT_ID, ignoreCase = true)) {
+                    return ApiResult(
+                        success = false,
+                        httpCode = 403,
+                        licensed = false,
+                        message = "Mã bản quyền thuộc sản phẩm '$product', không phải '$PRODUCT_ID'.",
+                        state = state(context),
+                    )
+                }
+                var expiryDateStr = json?.optString("expiry_date", "")?.trim().orEmpty()
+                val payloadB64 = json?.optString("payload_base64", "")?.trim().orEmpty()
+                val signatureB64 = json?.optString("signature_base64", "")?.trim().orEmpty()
+
+                if (payloadB64.isNotEmpty()) {
+                    runCatching {
+                        val decoded = String(Base64.getDecoder().decode(payloadB64), StandardCharsets.UTF_8)
+                        val payloadJson = JSONObject(decoded)
+                        if (expiryDateStr.isEmpty()) {
+                            expiryDateStr = payloadJson.optString("expiry_date", "").trim()
+                        }
+                    }
+                }
+
+                val expiryDays = parseExpiryDaysOrLifetime(expiryDateStr)
+                val seal = computeCacheSeal(cleanDev, licenseKey, expiryDays, payloadB64, signatureB64)
+                prefs(context).edit()
+                    .putString(KEY_LICENSE_CODE, licenseKey)
+                    .putString(KEY_VERIFIED_DEVICE, cleanDev)
+                    .putInt(KEY_EXPIRY_DAYS, expiryDays)
+                    .putString(KEY_EXPIRY_DATE_STR, expiryDateStr.ifEmpty { "Vĩnh viễn" })
+                    .putString(KEY_PAYLOAD_B64, payloadB64)
+                    .putString(KEY_SIGNATURE_B64, signatureB64)
+                    .putString(KEY_CACHE_SEAL, seal)
+                    .remove(KEY_REVOKED)
+                    .remove(KEY_REVOKED_REASON)
+                    .apply()
+
+                val updated = state(context)
+                return ApiResult(
+                    success = true,
+                    httpCode = 200,
+                    licensed = updated.isValid,
+                    message = if (updated.isValid) {
+                        "Kích hoạt bản quyền thành công! Hạn dùng: ${updated.expiryDateText ?: "Vĩnh viễn"}"
+                    } else {
+                        "Mã bản quyền đã hết hạn (${expiryDateStr})."
+                    },
+                    state = updated,
+                )
+            }
+            404 -> {
+                val msg = serverError ?: "Mã bản quyền không tồn tại (404)."
+                return ApiResult(false, 404, isLicensed(context), msg, state(context))
+            }
+            403 -> {
+                val msg = serverError ?: "Key đã hết hạn, bị thu hồi (Revoked) hoặc sai Product (403)."
+                if (prefs(context).getString(KEY_LICENSE_CODE, null).equals(licenseKey, ignoreCase = true)) {
+                    prefs(context).edit()
+                        .putBoolean(KEY_REVOKED, true)
+                        .putString(KEY_REVOKED_REASON, msg)
+                        .apply()
+                }
+                return ApiResult(false, 403, isLicensed(context), msg, state(context))
+            }
+            409 -> {
+                val msg = serverError ?: "Key đang dùng trên máy khác, vui lòng liên hệ Admin reset (409)."
+                return ApiResult(false, 409, isLicensed(context), msg, state(context))
+            }
+            else -> {
+                val msg = serverError ?: "Lỗi máy chủ (HTTP $httpCode)."
+                return ApiResult(false, httpCode, isLicensed(context), msg, state(context))
+            }
+        }
     }
 
     /**
-     * Verifies or activates the device against an online JSON/REST endpoint.
+     * 2. Fast License Status Check via `GET https://licenses.mewit.vn/get_license.php`
+     * Checks whether the stored (or given) `license_key` is still valid, not expired, not revoked,
+     * and matches this head unit's `device_id`.
      */
-    fun verifyOnline(
+    fun checkStatusOnline(
         context: Context,
-        customUrl: String? = null,
+        licenseKeyOverride: String? = null,
+        endpointUrl: String = CHECK_ENDPOINT,
         timeoutMs: Int = 8_000,
-    ): OnlineCheckResult {
+    ): ApiResult {
         val devId = deviceId(context)
-        val cleanDev = normalizeCode(devId)
-        val baseUrl = (customUrl ?: onlineServerUrl(context)).trim()
-        if (baseUrl.isEmpty()) {
-            return OnlineCheckResult(
+        val key = (licenseKeyOverride ?: prefs(context).getString(KEY_LICENSE_CODE, null))
+            ?.trim()?.uppercase(Locale.US).orEmpty()
+        if (key.isEmpty()) {
+            return ApiResult(
                 success = false,
-                licensed = isLicensed(context),
-                message = "Chưa cấu hình URL máy chủ kích hoạt / No license server URL configured.",
+                httpCode = 0,
+                licensed = false,
+                message = "Chưa có mã bản quyền nào được lưu trên thiết bị.",
                 state = state(context),
             )
         }
         return try {
-            val separator = if ('?' in baseUrl) '&' else '?'
-            val requestUrl = "$baseUrl${separator}device_id=${URLEncoder.encode(devId, "UTF-8")}"
-            val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
+            val query = "license_key=${URLEncoder.encode(key, "UTF-8")}" +
+                "&product=${URLEncoder.encode(PRODUCT_ID, "UTF-8")}" +
+                "&device_id=${URLEncoder.encode(devId, "UTF-8")}"
+            val separator = if ('?' in endpointUrl) '&' else '?'
+            val url = "$endpointUrl$separator$query"
+            val connection = openHttpConnection(context, url).apply {
                 connectTimeout = timeoutMs
                 readTimeout = timeoutMs
                 requestMethod = "GET"
                 useCaches = false
                 setRequestProperty("Accept", "application/json")
-                setRequestProperty("User-Agent", "DiPlay-LicenseClient/1.0")
+                setRequestProperty("User-Agent", "DiPlay-Android/1.0")
             }
             val code = connection.responseCode
-            if (code !in 200..299) {
-                return OnlineCheckResult(
-                    success = false,
-                    licensed = isLicensed(context),
-                    message = "Máy chủ trả về mã HTTP $code / Server returned HTTP $code",
-                    state = state(context),
-                )
-            }
-            val body = BufferedReader(InputStreamReader(connection.inputStream, StandardCharsets.UTF_8))
-                .use(BufferedReader::readText)
-            applyOnlineResponse(context, body, devId, cleanDev)
+            val stream: InputStream? = if (code in 200..299) connection.inputStream else connection.errorStream
+            val body = stream?.let {
+                BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).use(BufferedReader::readText)
+            }.orEmpty()
+            handleStatusResponse(context, key, code, body, devId)
         } catch (error: Throwable) {
-            OnlineCheckResult(
+            ApiResult(
                 success = false,
+                httpCode = -1,
                 licensed = isLicensed(context),
-                message = "Không thể kết nối máy chủ: ${error.localizedMessage ?: error.javaClass.simpleName}",
+                message = "Không thể kết nối máy chủ kiểm tra (${error.localizedMessage ?: error.javaClass.simpleName}).",
                 state = state(context),
             )
         }
     }
 
-    internal fun applyOnlineResponse(
+    internal fun handleStatusResponse(
         context: Context,
-        jsonText: String,
+        licenseKey: String,
+        httpCode: Int,
+        body: String,
         devId: String = deviceId(context),
-        cleanDev: String = normalizeCode(devId),
-    ): OnlineCheckResult {
-        val root = JSONObject(jsonText)
-        val record: JSONObject? = when {
-            root.has("devices") -> {
-                val devices = root.optJSONObject("devices")
-                devices?.optJSONObject(devId)
-                    ?: devices?.optJSONObject(cleanDev)
-                    ?: devices?.keys()?.asSequence()?.firstOrNull { key ->
-                        normalizeCode(key) == cleanDev
-                    }?.let(devices::optJSONObject)
-            }
-            root.has(devId) -> root.optJSONObject(devId)
-            root.has(cleanDev) -> root.optJSONObject(cleanDev)
-            root.has("status") || root.has("valid") || root.has("key") -> root
-            else -> null
+    ): ApiResult {
+        val cleanDev = normalizeCode(devId)
+        val json = runCatching { JSONObject(body) }.getOrNull()
+        if (httpCode == 404) {
+            clearLicense(context)
+            return ApiResult(
+                success = true,
+                httpCode = 404,
+                licensed = false,
+                message = "Mã bản quyền không tồn tại trên hệ thống (404).",
+                state = state(context),
+            )
+        }
+        if (httpCode !in 200..299 || json == null) {
+            val err = json?.optString("error", "")?.takeIf { it.isNotBlank() }
+                ?: "Không thể kiểm tra trạng thái (HTTP $httpCode)."
+            return ApiResult(false, httpCode, isLicensed(context), err, state(context))
         }
 
-        if (record == null) {
-            return OnlineCheckResult(
+        val valid = json.optBoolean("valid", false)
+        val isRevoked = json.optBoolean("is_revoked", false) ||
+            json.optString("status", "").equals("revoked", ignoreCase = true)
+        val isExpired = json.optBoolean("is_expired", false)
+        val deviceMatch = if (json.has("device_match") && !json.isNull("device_match")) {
+            json.optBoolean("device_match", true)
+        } else true
+        val product = json.optString("product", PRODUCT_ID)
+        val expiryDateStr = json.optString("expiry_date", "").trim()
+        val username = json.optString("username", "").trim().takeIf { it.isNotEmpty() }
+
+        if (!product.equals(PRODUCT_ID, ignoreCase = true)) {
+            clearLicense(context)
+            return ApiResult(
                 success = true,
-                licensed = isLicensed(context),
-                message = "Thiết bị $devId chưa có trong danh sách kích hoạt Online.",
+                httpCode = 403,
+                licensed = false,
+                message = "Key không thuộc sản phẩm '$PRODUCT_ID'.",
                 state = state(context),
             )
         }
 
-        val statusStr = record.optString("status", "").lowercase(Locale.US)
-        val revoked = record.optBoolean("revoked", false) || statusStr == "revoked" || statusStr == "blocked"
-        if (revoked) {
-            val reason = record.optString("reason", "Bản quyền đã bị thu hồi từ máy chủ.")
+        if (isRevoked) {
+            val reason = "Mã bản quyền đã bị thu hồi (Revoked)."
             prefs(context).edit()
                 .putBoolean(KEY_REVOKED, true)
                 .putString(KEY_REVOKED_REASON, reason)
                 .apply()
-            val updated = state(context)
-            return OnlineCheckResult(
+            return ApiResult(true, 200, false, reason, state(context))
+        }
+
+        if (!deviceMatch) {
+            clearLicense(context)
+            return ApiResult(
                 success = true,
+                httpCode = 409,
                 licensed = false,
-                message = reason,
-                state = updated,
-            )
-        }
-
-        val explicitKey = record.optString("key", "").trim()
-        if (explicitKey.isNotEmpty()) {
-            val activated = activateOffline(context, explicitKey)
-            if (activated.isValid) {
-                return OnlineCheckResult(
-                    success = true,
-                    licensed = true,
-                    message = "Đã kích hoạt bản quyền Online thành công!",
-                    state = activated,
-                )
-            }
-        }
-
-        val validFlag = record.optBoolean("valid", statusStr == "active" || statusStr == "valid" || statusStr == "licensed")
-        if (!validFlag) {
-            return OnlineCheckResult(
-                success = true,
-                licensed = isLicensed(context),
-                message = "Thiết bị chưa được cấp phép trên máy chủ.",
+                message = "Key đang gắn với một thiết bị khác, vui lòng liên hệ Admin reset.",
                 state = state(context),
             )
         }
 
-        val expiresRaw = record.optString("expires", "lifetime").trim().lowercase(Locale.US)
-        val expiryDays = when {
-            expiresRaw.isEmpty() || expiresRaw == "lifetime" || expiresRaw == "permanent" || expiresRaw == "never" ->
-                LIFETIME_EXPIRY_DAYS
-            else -> runCatching { dateToExpiryDays(expiresRaw) }.getOrDefault(LIFETIME_EXPIRY_DAYS)
+        if (isExpired || !valid) {
+            val expiryDays = if (expiryDateStr.isNotEmpty()) parseExpiryDaysOrLifetime(expiryDateStr) else 1
+            val payloadB64 = prefs(context).getString(KEY_PAYLOAD_B64, "").orEmpty()
+            val signatureB64 = prefs(context).getString(KEY_SIGNATURE_B64, "").orEmpty()
+            prefs(context).edit()
+                .putString(KEY_LICENSE_CODE, licenseKey)
+                .putString(KEY_EXPIRY_DATE_STR, expiryDateStr.ifEmpty { "Đã hết hạn" })
+                .putInt(KEY_EXPIRY_DAYS, expiryDays)
+                .putString(KEY_CACHE_SEAL, computeCacheSeal(cleanDev, licenseKey, expiryDays, payloadB64, signatureB64))
+                .apply()
+            return ApiResult(
+                success = true,
+                httpCode = 200,
+                licensed = false,
+                message = if (isExpired) "Mã bản quyền đã hết hạn ($expiryDateStr)." else "Mã bản quyền chưa hợp lệ hoặc chưa kích hoạt.",
+                state = state(context),
+            )
         }
-        // Generate and persist a signed key for this device so offline usage continues seamlessly.
-        val generatedKey = generateLicenseKey(devId, expiryDays)
-        prefs(context).edit()
-            .putString(KEY_LICENSE_CODE, generatedKey)
-            .putString(KEY_ONLINE_VERIFIED_DEVICE, cleanDev)
-            .putInt(KEY_ONLINE_EXPIRY_DAYS, expiryDays)
-            .remove(KEY_REVOKED)
-            .remove(KEY_REVOKED_REASON)
-            .apply()
+
+        // Valid and device_match != false -> update local cache with latest expiry_date and username
+        val expiryDays = parseExpiryDaysOrLifetime(expiryDateStr)
+        val payloadB64 = prefs(context).getString(KEY_PAYLOAD_B64, "").orEmpty()
+        val signatureB64 = prefs(context).getString(KEY_SIGNATURE_B64, "").orEmpty()
+        val seal = computeCacheSeal(cleanDev, licenseKey, expiryDays, payloadB64, signatureB64)
+        prefs(context).edit().apply {
+            putString(KEY_LICENSE_CODE, licenseKey)
+            putString(KEY_VERIFIED_DEVICE, cleanDev)
+            putInt(KEY_EXPIRY_DAYS, expiryDays)
+            putString(KEY_EXPIRY_DATE_STR, expiryDateStr.ifEmpty { "Vĩnh viễn" })
+            putString(KEY_CACHE_SEAL, seal)
+            if (username != null) putString(KEY_USERNAME, username)
+            remove(KEY_REVOKED)
+            remove(KEY_REVOKED_REASON)
+        }.apply()
+
         val updated = state(context)
-        return OnlineCheckResult(
+        return ApiResult(
             success = true,
+            httpCode = 200,
             licensed = updated.isValid,
-            message = if (updated.isValid) "Đã kích hoạt bản quyền Online thành công!" else "Bản quyền trên máy chủ đã hết hạn.",
+            message = "Bản quyền hợp lệ (Hạn dùng: ${updated.expiryDateText ?: "Vĩnh viễn"}).",
             state = updated,
         )
     }
 
+    fun clearLicense(context: Context) {
+        prefs(context).edit()
+            .remove(KEY_LICENSE_CODE)
+            .remove(KEY_EXPIRY_DATE_STR)
+            .remove(KEY_EXPIRY_DAYS)
+            .remove(KEY_VERIFIED_DEVICE)
+            .remove(KEY_PAYLOAD_B64)
+            .remove(KEY_SIGNATURE_B64)
+            .remove(KEY_USERNAME)
+            .remove(KEY_CACHE_SEAL)
+            .remove(KEY_REVOKED)
+            .remove(KEY_REVOKED_REASON)
+            .apply()
+    }
+
     fun formatExpiryDate(epochMs: Long?): String {
         if (epochMs == null) return "Vĩnh viễn / Lifetime"
-        val sdf = SimpleDateFormat("dd/MM/yyyy", Locale.US).apply {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
         return sdf.format(Date(epochMs))

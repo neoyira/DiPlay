@@ -874,6 +874,21 @@ open class CarPlayHostActivity : ComponentActivity() {
             OwnScreenStart.start(this, Intent(this, DiPlayActivity::class.java), ::appendLog)
             finish(); return
         }
+        if (!LicenseManager.isTestEnvironment()) {
+            val app = applicationContext
+            Thread({
+                val res = LicenseManager.checkStatusOnline(app)
+                if (res.success && !res.licensed) {
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed) {
+                            CarPlayBackgroundSession.stop()
+                            OwnScreenStart.start(this, Intent(this, DiPlayActivity::class.java), ::appendLog)
+                            finish()
+                        }
+                    }
+                }
+            }, "diplay-host-license-check").start()
+        }
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         getSystemService(android.hardware.display.DisplayManager::class.java)
             ?.registerDisplayListener(clusterDisplayListener, mainHandler)

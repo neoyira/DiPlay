@@ -2530,18 +2530,14 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
 
     private enum class UpdateStage { IDLE, CHECKING, AVAILABLE, DOWNLOADING, VERIFYING, READY, FAILED }
 
-    private fun openBackup(from: SettingsCategory = SettingsCategory.ABOUT) {
-        backupOpenedFrom = from
-        page = "backup"
-        render()
-    }
-
     private fun checkLicenseOnlineInBackground() {
         if (LicenseManager.isTestEnvironment()) return
         val app = applicationContext
+        val currentState = LicenseManager.state(app)
+        if (currentState.licenseKey.isNullOrBlank()) return
         Thread({
-            val wasValid = LicenseManager.state(app).isValid
-            val result = LicenseManager.verifyOnline(app)
+            val wasValid = currentState.isValid
+            val result = LicenseManager.checkStatusOnline(app)
             if (result.success && result.licensed != wasValid) {
                 runOnUiThread {
                     if (isFinishing || isDestroyed) return@runOnUiThread
@@ -2561,17 +2557,22 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         val statusText = when (st.status) {
             LicenseManager.Status.VALID_LIFETIME -> "Đã kích hoạt · Vĩnh viễn (Lifetime)"
             LicenseManager.Status.VALID_TIMED ->
-                "Đã kích hoạt · Hết hạn: ${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
+                "Đã kích hoạt · Hết hạn: ${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
             LicenseManager.Status.EXPIRED ->
-                "Đã hết hạn (${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)})"
+                "Đã hết hạn (${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)})"
             LicenseManager.Status.REVOKED ->
                 "Đã thu hồi (${st.revokedReason ?: "Revoked"})"
             LicenseManager.Status.UNLICENSED -> "Chưa kích hoạt (Unlicensed)"
         }
-        section(content, "Bản quyền phần mềm · Software License") { card ->
+        section(content, "Bản quyền MEWIT · Software License") { card ->
             card.addView(label("Trạng thái: $statusText", 16, if (st.isValid) READY else WARNING, true))
-            card.addView(label("Mã thiết bị (Device ID): ${st.deviceId}", 15, TEXT).apply {
-                setPadding(0, dp(6), 0, dp(10))
+            if (!st.licenseKey.isNullOrBlank()) {
+                card.addView(label("License Key: ${st.licenseKey}${st.username?.let { " ($it)" }.orEmpty()}", 15, TEXT).apply {
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }
+            card.addView(label("Mã thiết bị (Device ID): ${st.deviceId}", 15, MUTED).apply {
+                setPadding(0, dp(4), 0, dp(10))
             })
             card.addView(actionButton("Quản lý / Đổi mã bản quyền (Manage License)", false) {
                 page = "license"
@@ -2584,18 +2585,18 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         val compact = isCompactLayout
         val st = LicenseManager.state(this)
         val devId = st.deviceId
-        content.addView(label("Kích hoạt bản quyền DiPlay · License Activation", if (compact) 24 else 32, TEXT, true))
+        content.addView(label("Kích hoạt bản quyền DiPlay · MEWIT License", if (compact) 24 else 32, TEXT, true))
         val statusLine = when (st.status) {
             LicenseManager.Status.VALID_LIFETIME ->
                 "Trạng thái: Đã kích hoạt Vĩnh viễn (Lifetime License)"
             LicenseManager.Status.VALID_TIMED ->
-                "Trạng thái: Đã kích hoạt đến ${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
+                "Trạng thái: Đã kích hoạt đến ${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
             LicenseManager.Status.EXPIRED ->
-                "Trạng thái: Mã bản quyền đã hết hạn vào ${LicenseManager.formatExpiryDate(st.expiresAtEpochMs)}. Vui lòng nhập mã gia hạn mới."
+                "Trạng thái: Mã bản quyền đã hết hạn (${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)}). Vui lòng gia hạn hoặc nhập mã mới."
             LicenseManager.Status.REVOKED ->
                 "Trạng thái: Bản quyền đã bị thu hồi (${st.revokedReason ?: "Revoked"})."
             LicenseManager.Status.UNLICENSED ->
-                "Vui lòng gửi Mã thiết bị bên dưới cho quản trị viên để nhận Mã kích hoạt (hoặc bấm Kích hoạt Online)."
+                "Vui lòng nhập License Key (VD: MEWIT-XXXX-XXXX-XXXX) để kích hoạt gắn với thiết bị này."
         }
         content.addView(label(statusLine, 16, if (st.isValid) READY else WARNING, true).apply {
             setPadding(0, dp(8), 0, dp(SETTINGS_BLOCK_GAP_DP))
@@ -2604,8 +2605,11 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         val deviceCard = card().apply {
             addView(label("MÃ THIẾT BỊ CỦA MÀN HÌNH XE (DEVICE ID)", 13, ACCENT, true).apply { letterSpacing = .08f })
             addView(label(devId, if (compact) 24 else 30, TEXT, true).apply {
-                setPadding(0, dp(8), 0, dp(12))
+                setPadding(0, dp(8), 0, dp(4))
                 setTextIsSelectable(true)
+            })
+            addView(label(LicenseManager.deviceLabel(), 13, MUTED).apply {
+                setPadding(0, 0, 0, dp(10))
             })
             val qrSide = dp(if (compact) 150 else 180)
             val qrView = ImageView(this@DiPlayActivity).apply {
@@ -2625,7 +2629,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
 
         val keyInput = EditText(this).apply {
             setSingleLine()
-            hint = "XXXX-XXXX-XXXX-XXXX"
+            hint = "MEWIT-ABCD-1234-EFGH"
             textSize = if (compact) 18f else 20f
             setTextColor(TEXT)
             setHintTextColor(MUTED)
@@ -2637,46 +2641,27 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                 android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI or
                 android.view.inputmethod.EditorInfo.IME_ACTION_DONE
-            st.licenseKey?.takeIf { it != "ONLINE" }?.let(::setText)
+            st.licenseKey?.let(::setText)
         }
 
         val activateCard = card().apply {
-            addView(label("NHẬP MÃ KÍCH HOẠT (16 KÝ TỰ)", 13, ACCENT, true).apply { letterSpacing = .08f })
-            addView(label("Hỗ trợ mã kích hoạt Offline theo thiết bị (Vĩnh viễn hoặc Có thời hạn) không cần mạng Internet.", 14, MUTED).apply {
+            addView(label("NHẬP MÃ BẢN QUYỀN (LICENSE KEY)", 13, ACCENT, true).apply { letterSpacing = .08f })
+            addView(label("Hệ thống tự động kiểm tra hạn dùng, gắn cứng Mã thiết bị (Device ID) và lưu chữ ký số để xe vẫn dùng được khi mất sóng.", 14, MUTED).apply {
                 setPadding(0, dp(6), 0, dp(12))
             })
             addView(keyInput, LinearLayout.LayoutParams(-1, dp(if (compact) 54 else 62)).apply {
                 bottomMargin = dp(CONTROL_GAP_DP)
             })
-            addView(actionButton("Kích hoạt bằng Mã (Activate Key)", true) {
+            addView(actionButton("Kích hoạt gắn thiết bị (Activate License)", true) {
                 val entered = keyInput.text?.toString().orEmpty().trim()
                 if (entered.isEmpty()) {
-                    toast("Vui lòng nhập Mã kích hoạt 16 ký tự")
+                    toast("Vui lòng nhập Mã bản quyền (License Key)")
                     return@actionButton
                 }
-                val parsed = LicenseManager.verifyKeyForDevice(entered, devId)
-                if (parsed == null) {
-                    toast("Mã kích hoạt không hợp lệ hoặc không đúng với Mã thiết bị $devId")
-                    return@actionButton
-                }
-                val updated = LicenseManager.activateOffline(this@DiPlayActivity, entered)
-                if (updated.isValid) {
-                    val expMsg = if (updated.expiresAtEpochMs == null) "Vĩnh viễn"
-                    else "Hạn dùng đến ${LicenseManager.formatExpiryDate(updated.expiresAtEpochMs)}"
-                    toast("Kích hoạt thành công ($expMsg)!")
-                    page = "home"
-                    render()
-                } else {
-                    toast("Mã kích hoạt này đã hết hạn vào ${LicenseManager.formatExpiryDate(updated.expiresAtEpochMs)}")
-                    render()
-                }
-            }, matchButton(0, if (compact) 54 else 64))
-
-            addView(actionButton("Kích hoạt / Kiểm tra Online (Online Check)", false) {
-                toast("Đang kiểm tra bản quyền trên máy chủ...")
+                toast("Đang kích hoạt bản quyền với máy chủ MEWIT...")
                 val app = applicationContext
                 Thread({
-                    val res = LicenseManager.verifyOnline(app)
+                    val res = LicenseManager.activateWithServer(app, entered)
                     runOnUiThread {
                         if (isFinishing || isDestroyed) return@runOnUiThread
                         toast(res.message)
@@ -2685,11 +2670,31 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                         }
                         render()
                     }
-                }, "diplay-license-manual-online").start()
-            }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+                }, "diplay-mewit-activate").start()
+            }, matchButton(0, if (compact) 54 else 64))
 
-            addView(actionButton("Cấu hình Máy chủ Online (Server URL)", false) {
-                showOnlineServerDialog()
+            addView(actionButton("Kiểm tra nhanh trạng thái Key (Check Status)", false) {
+                val entered = keyInput.text?.toString().orEmpty().trim().ifEmpty { st.licenseKey.orEmpty() }
+                if (entered.isEmpty()) {
+                    toast("Vui lòng nhập Mã bản quyền cần kiểm tra")
+                    return@actionButton
+                }
+                toast("Đang kiểm tra trạng thái License...")
+                val app = applicationContext
+                Thread({
+                    val res = LicenseManager.checkStatusOnline(app, entered)
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        toast(res.message)
+                        if (!res.licensed && CarPlayBackgroundSession.hasSession()) {
+                            CarPlayBackgroundSession.stop()
+                        }
+                        if (res.licensed) {
+                            page = "home"
+                        }
+                        render()
+                    }
+                }, "diplay-mewit-status").start()
             }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
 
             if (st.isValid) {
@@ -2699,8 +2704,8 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                 }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
                 addView(actionButton("Xóa mã bản quyền trên xe này (Deactivate)", false) {
                     appDialogBuilder()
-                        .setTitle("Xóa bản quyền?")
-                        .setMessage("Bạn có chắc muốn xóa mã kích hoạt hiện tại khỏi thiết bị này không?")
+                        .setTitle("Xóa bản quyền khỏi máy?")
+                        .setMessage("Bạn có chắc muốn xóa mã bản quyền hiện tại khỏi màn hình xe này không?")
                         .setPositiveButton("Xóa") { _, _ ->
                             LicenseManager.clearLicense(this@DiPlayActivity)
                             if (CarPlayBackgroundSession.hasSession()) CarPlayBackgroundSession.stop()
@@ -2729,29 +2734,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         }
     }
 
-    private fun showOnlineServerDialog() {
-        val input = EditText(this).apply {
-            setSingleLine()
-            setText(LicenseManager.onlineServerUrl(this@DiPlayActivity))
-            hint = LicenseManager.DEFAULT_ONLINE_LICENSE_URL
-            setTextColor(TEXT)
-            setHintTextColor(MUTED)
-            setPadding(dp(20), dp(14), dp(20), dp(14))
-        }
-        appDialogBuilder()
-            .setTitle("Máy chủ License Online (JSON / REST API)")
-            .setView(input)
-            .setPositiveButton(getString(R.string.save)) { _, _ ->
-                LicenseManager.saveOnlineServerUrl(this, input.text?.toString().orEmpty())
-                toast("Đã lưu địa chỉ máy chủ License Online")
-            }
-            .setNeutralButton("Mặc định") { _, _ ->
-                LicenseManager.saveOnlineServerUrl(this, "")
-                toast("Đã khôi phục URL mặc định")
-            }
-            .setNegativeButton(getString(R.string.cancel), null)
-            .show()
-    }
+    private fun openBackup(from: SettingsCategory = SettingsCategory.ABOUT) {
         backupOpenedFrom = from
         page = "backup"
         render()
