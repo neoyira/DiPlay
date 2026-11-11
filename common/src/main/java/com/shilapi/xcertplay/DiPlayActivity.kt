@@ -714,6 +714,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
             else content.setPadding(dp(32), dp(24), dp(32), dp(32))
             content.addView(header)
             content.addView(space(when {
+                page == "license" -> 8
                 compact && (page == "settings" || page == "home") -> SETTINGS_BLOCK_GAP_DP
                 compact -> 8
                 else -> 24
@@ -2585,57 +2586,57 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         val compact = isCompactLayout
         val st = LicenseManager.state(this)
         val devId = st.deviceId
-        content.addView(label("Kích hoạt bản quyền DiPlay · MEWIT License", if (compact) 24 else 32, TEXT, true))
         val statusLine = when (st.status) {
             LicenseManager.Status.VALID_LIFETIME ->
-                "Trạng thái: Đã kích hoạt Vĩnh viễn (Lifetime License)"
+                "Đã kích hoạt Vĩnh viễn (Lifetime License)"
             LicenseManager.Status.VALID_TIMED ->
-                "Trạng thái: Đã kích hoạt đến ${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
+                "Đã kích hoạt đến ${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)} (Còn ${st.daysRemaining ?: 0} ngày)"
             LicenseManager.Status.EXPIRED ->
-                "Trạng thái: Mã bản quyền đã hết hạn (${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)}). Vui lòng gia hạn hoặc nhập mã mới."
+                "Mã bản quyền đã hết hạn (${st.expiryDateText ?: LicenseManager.formatExpiryDate(st.expiresAtEpochMs)}). Vui lòng gia hạn hoặc nhập mã mới."
             LicenseManager.Status.REVOKED ->
-                "Trạng thái: Bản quyền đã bị thu hồi (${st.revokedReason ?: "Revoked"})."
+                "Bản quyền đã bị thu hồi (${st.revokedReason ?: "Revoked"})."
             LicenseManager.Status.UNLICENSED ->
-                "Vui lòng nhập License Key (VD: MEWIT-XXXX-XXXX-XXXX) để kích hoạt gắn với thiết bị này."
+                "Nhập License Key để kích hoạt gắn với thiết bị này."
         }
-        content.addView(label(statusLine, 16, if (st.isValid) READY else WARNING, true).apply {
-            setPadding(0, dp(8), 0, dp(SETTINGS_BLOCK_GAP_DP))
+        content.addView(label("Kích hoạt bản quyền MEWIT · $statusLine", if (compact) 15 else 18, if (st.isValid) READY else WARNING, true).apply {
+            setPadding(0, 0, 0, dp(10))
         })
 
         val deviceCard = card().apply {
-            addView(label("MÃ THIẾT BỊ CỦA MÀN HÌNH XE (DEVICE ID)", 13, ACCENT, true).apply { letterSpacing = .08f })
-            addView(label(devId, if (compact) 24 else 30, TEXT, true).apply {
-                setPadding(0, dp(8), 0, dp(4))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            addView(label("MÃ THIẾT BỊ (DEVICE ID)", 12, ACCENT, true).apply { letterSpacing = .08f })
+            addView(label(devId, if (compact) 20 else 24, TEXT, true).apply {
+                setPadding(0, dp(4), 0, dp(2))
                 setTextIsSelectable(true)
             })
-            addView(label(LicenseManager.deviceLabel(), 13, MUTED).apply {
-                setPadding(0, 0, 0, dp(10))
+            addView(label(LicenseManager.deviceLabel(), 12, MUTED).apply {
+                setPadding(0, 0, 0, dp(8))
             })
-            val qrSide = dp(if (compact) 150 else 180)
+            val qrSide = dp(if (compact) 110 else 130)
             val qrView = ImageView(this@DiPlayActivity).apply {
                 setImageBitmap(SettingsQrCode.encode(devId, qrSide))
                 scaleType = ImageView.ScaleType.FIT_CENTER
             }
-            addView(qrView, LinearLayout.LayoutParams(qrSide + dp(16), qrSide + dp(16)).apply {
+            addView(qrView, LinearLayout.LayoutParams(qrSide + dp(8), qrSide + dp(8)).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
-                bottomMargin = dp(CONTROL_GAP_DP)
+                bottomMargin = dp(8)
             })
-            addView(actionButton("Sao chép Mã thiết bị (Copy ID)", false) {
+            addView(actionButton("Sao chép ID (Copy ID)", false) {
                 val cm = getSystemService(android.content.ClipboardManager::class.java)
                 cm?.setPrimaryClip(android.content.ClipData.newPlainText("DiPlay Device ID", devId))
                 toast("Đã sao chép Mã thiết bị: $devId")
-            }, matchButton(0, if (compact) 52 else 60))
+            }, matchButton(0, if (compact) 44 else 50))
         }
 
         val keyInput = EditText(this).apply {
             setSingleLine()
-            hint = "MEWIT-ABCD-1234-EFGH"
-            textSize = if (compact) 18f else 20f
+            hint = "Nhập License Key (VD: MEWIT-XXXX...)"
+            textSize = if (compact) 16f else 18f
             setTextColor(TEXT)
             setHintTextColor(MUTED)
             background = buttonShape(BUTTON, BORDER)
             gravity = Gravity.CENTER
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
             inputType = android.text.InputType.TYPE_CLASS_TEXT or
                 android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
                 android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -2645,20 +2646,21 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         }
 
         val activateCard = card().apply {
-            addView(label("NHẬP MÃ BẢN QUYỀN (LICENSE KEY)", 13, ACCENT, true).apply { letterSpacing = .08f })
-            addView(label("Hệ thống tự động kiểm tra hạn dùng, gắn cứng Mã thiết bị (Device ID) và lưu chữ ký số để xe vẫn dùng được khi mất sóng.", 14, MUTED).apply {
-                setPadding(0, dp(6), 0, dp(12))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            addView(label("NHẬP MÃ BẢN QUYỀN (LICENSE KEY)", 12, ACCENT, true).apply { letterSpacing = .08f })
+            addView(label("Điền mã MEWIT hoặc mã kích hoạt Offline 16 ký tự vào ô bên dưới:", 13, MUTED).apply {
+                setPadding(0, dp(4), 0, dp(8))
             })
-            addView(keyInput, LinearLayout.LayoutParams(-1, dp(if (compact) 54 else 62)).apply {
-                bottomMargin = dp(CONTROL_GAP_DP)
+            addView(keyInput, LinearLayout.LayoutParams(-1, dp(if (compact) 48 else 54)).apply {
+                bottomMargin = dp(10)
             })
-            addView(actionButton("Kích hoạt gắn thiết bị (Activate License)", true) {
+            addView(actionButton("Kích hoạt bản quyền (Activate)", true) {
                 val entered = keyInput.text?.toString().orEmpty().trim()
                 if (entered.isEmpty()) {
                     toast("Vui lòng nhập Mã bản quyền (License Key)")
                     return@actionButton
                 }
-                toast("Đang kích hoạt bản quyền với máy chủ MEWIT...")
+                toast("Đang kiểm tra và kích hoạt bản quyền...")
                 val app = applicationContext
                 Thread({
                     val res = LicenseManager.activateWithServer(app, entered)
@@ -2671,9 +2673,9 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                         render()
                     }
                 }, "diplay-mewit-activate").start()
-            }, matchButton(0, if (compact) 54 else 64))
+            }, matchButton(0, if (compact) 48 else 54))
 
-            addView(actionButton("Kiểm tra nhanh trạng thái Key (Check Status)", false) {
+            addView(actionButton("Kiểm tra trạng thái Key (Check Status)", false) {
                 val entered = keyInput.text?.toString().orEmpty().trim().ifEmpty { st.licenseKey.orEmpty() }
                 if (entered.isEmpty()) {
                     toast("Vui lòng nhập Mã bản quyền cần kiểm tra")
@@ -2695,13 +2697,13 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                         render()
                     }
                 }, "diplay-mewit-status").start()
-            }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+            }, matchButton(8, if (compact) 44 else 50))
 
             if (st.isValid) {
                 addView(actionButton("Vào màn hình chính CarPlay (Open Home)", false) {
                     page = "home"
                     render()
-                }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+                }, matchButton(8, if (compact) 44 else 50))
                 addView(actionButton("Xóa mã bản quyền trên xe này (Deactivate)", false) {
                     appDialogBuilder()
                         .setTitle("Xóa bản quyền khỏi máy?")
@@ -2714,23 +2716,24 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                         }
                         .setNegativeButton(getString(R.string.cancel), null)
                         .show()
-                }, matchButton(CONTROL_GAP_DP, if (compact) 52 else 60))
+                }, matchButton(8, if (compact) 44 else 50))
             }
         }
 
-        val wide = resources.configuration.screenWidthDp >= 850
-        if (wide) {
+        val sideBySide = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+            resources.configuration.screenWidthDp >= 500
+        if (sideBySide) {
             content.addView(row().apply {
                 gravity = Gravity.TOP
-                addView(deviceCard, LinearLayout.LayoutParams(0, -2, 1f))
-                addView(space(24), LinearLayout.LayoutParams(dp(24), 1))
+                addView(deviceCard, LinearLayout.LayoutParams(0, -2, 0.9f))
+                addView(space(12), LinearLayout.LayoutParams(dp(12), 1))
                 addView(activateCard, LinearLayout.LayoutParams(0, -2, 1.3f))
             })
         } else {
-            content.addView(deviceCard, LinearLayout.LayoutParams(-1, -2).apply {
-                bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+            content.addView(activateCard, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(CONTROL_GAP_DP)
             })
-            content.addView(activateCard)
+            content.addView(deviceCard)
         }
     }
 
